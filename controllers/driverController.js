@@ -1,7 +1,7 @@
-// controllers/driverController.js
+// PATH: src/controllers/driverController.js
 //
 // Production-ready multi-tenant driver module.
-// Architecture aligned with customerController.js
+// Compatible with dashboardController (exports collectDriverReminders).
 //
 // Accounting rules:
 //   totalEarned  = sum of driverPaymentAmount on NON-cancelled bookings
@@ -26,8 +26,6 @@ import {
   deleteFromCloudinary,
 } from "../utils/cloudinaryUpload.js";
 
-
-
 // ======================================================
 // CONSTANTS
 // ======================================================
@@ -51,7 +49,6 @@ const ALLOWED_WRITE_FIELDS = [
   "phone",
   "email",
   "address",
-  // photo, cnicFront, cnicBack, licenseImage REMOVED
   "cnic",
   "licenseNumber",
   "licenseExpiry",
@@ -100,8 +97,8 @@ const hasSensitiveFiles = (req) => {
   const files = req.files || {};
   return Boolean(
     files.cnicFront?.[0] ||
-    files.cnicBack?.[0] ||
-    files.licenseImage?.[0]
+      files.cnicBack?.[0] ||
+      files.licenseImage?.[0]
   );
 };
 
@@ -190,6 +187,7 @@ const normalizePayload = (body = {}) => {
 const validatePaymentSettings = (data, existing = {}) => {
   const type = data.paymentType ?? existing.paymentType ?? "fixed";
   const rate = Number(data.paymentRate ?? existing.paymentRate ?? 0);
+  const salary = Number(data.salary ?? existing.salary ?? 0);
 
   if (!PAYMENT_TYPES.includes(type)) {
     throw fail("Invalid driver payment type. Allowed: fixed, percentage.", 400);
@@ -199,6 +197,9 @@ const validatePaymentSettings = (data, existing = {}) => {
   }
   if (type === "percentage" && rate > 100) {
     throw fail("Driver percentage cannot exceed 100%.", 400);
+  }
+  if (!Number.isFinite(salary) || salary < 0) {
+    throw fail("Salary must be zero or greater.", 400);
   }
 };
 
@@ -304,6 +305,12 @@ const formatDriver = (driver, financials = null, req = null) => {
     inactive: "Inactive",
   };
 
+  // Derive a clear payment mode for the UI
+  const salary = money(d.salary);
+  const paymentRate = money(d.paymentRate);
+  const paymentMode =
+    salary > 0 && paymentRate === 0 ? "salary" : "per_booking";
+
   const dto = {
     id: id(d._id),
     name: d.name || "",
@@ -314,9 +321,13 @@ const formatDriver = (driver, financials = null, req = null) => {
     photo: d.photo || "",
     status: statusLabels[d.status] || "Inactive",
     rawStatus: d.status || "available",
-    salary: money(d.salary),
+
+    // Payment configuration
+    salary,
     paymentType: d.paymentType || "fixed",
-    paymentRate: money(d.paymentRate),
+    paymentRate,
+    paymentMode, // "salary" | "per_booking"
+
     createdAt: d.createdAt,
     updatedAt: d.updatedAt,
     locked: !sensitive,
@@ -343,7 +354,7 @@ const formatDriver = (driver, financials = null, req = null) => {
 };
 
 // ======================================================
-// LICENCE EXPIRY REMINDERS
+// LICENCE EXPIRY REMINDERS (used by dashboardController)
 // ======================================================
 
 /**
@@ -354,7 +365,11 @@ export async function collectDriverReminders(req, daysBefore) {
   if (!canViewSensitive(req)) return [];
 
   let horizonDays = 7;
-  if (daysBefore !== undefined && daysBefore !== null && Number.isFinite(Number(daysBefore))) {
+  if (
+    daysBefore !== undefined &&
+    daysBefore !== null &&
+    Number.isFinite(Number(daysBefore))
+  ) {
     horizonDays = Math.max(1, Math.min(90, Math.floor(Number(daysBefore))));
   }
 
@@ -373,7 +388,10 @@ export async function collectDriverReminders(req, daysBefore) {
           (daysBefore === undefined || daysBefore === null) &&
           Number.isFinite(Number(setting.reminderDaysBefore))
         ) {
-          horizonDays = Math.max(1, Math.min(90, Math.floor(Number(setting.reminderDaysBefore))));
+          horizonDays = Math.max(
+            1,
+            Math.min(90, Math.floor(Number(setting.reminderDaysBefore)))
+          );
         }
         if (setting.timezone) timezone = setting.timezone;
       }
@@ -565,14 +583,21 @@ export const getAvailableDrivers = wrap(async (req, res) => {
   const { pickupDate, returnDate } = req.query;
 
   if (Boolean(pickupDate) !== Boolean(returnDate)) {
-    throw fail("Both pickup and return dates are required for availability check.", 400);
+    throw fail(
+      "Both pickup and return dates are required for availability check.",
+      400
+    );
   }
 
   if (pickupDate && returnDate) {
     const start = new Date(pickupDate);
     const end = new Date(returnDate);
 
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) {
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      end <= start
+    ) {
       throw fail("Enter valid pickup and return dates.", 400);
     }
 
@@ -593,9 +618,7 @@ export const getAvailableDrivers = wrap(async (req, res) => {
     filter.status = "available";
   }
 
-  const drivers = await Driver.find(filter)
-    .sort({ name: 1 })
-    .lean();
+  const drivers = await Driver.find(filter).sort({ name: 1 }).lean();
 
   send(
     res,
@@ -616,7 +639,7 @@ export const getDriver = wrap(async (req, res) => {
 });
 
 // ======================================================
-// 5. CREATE DRIVER
+// 5. CREATE DRIVER (images included)
 // ======================================================
 
 export const createDriver = wrap(async (req, res) => {
@@ -630,7 +653,8 @@ export const createDriver = wrap(async (req, res) => {
   // Check both body fields and uploaded files
   if (
     !canEditSensitive(req) &&
-    (SENSITIVE_FIELDS.some((f) => data[f] !== undefined) || hasSensitiveFiles(req))
+    (SENSITIVE_FIELDS.some((f) => data[f] !== undefined) ||
+      hasSensitiveFiles(req))
   ) {
     throw fail(
       "You do not have permission to change sensitive driver information.",
@@ -646,6 +670,12 @@ export const createDriver = wrap(async (req, res) => {
     if (exists) throw fail("A driver with this CNIC already exists.", 409);
   }
 
+  // Defaults
+  if (!data.paymentType) data.paymentType = "fixed";
+  if (data.paymentRate === undefined) data.paymentRate = 0;
+  if (data.salary === undefined) data.salary = 0;
+  if (!data.status) data.status = "available";
+
   const uploadedPublicIds = [];
   const folder = `rent-a-car/${req.tenant.businessId}/drivers`;
 
@@ -656,7 +686,12 @@ export const createDriver = wrap(async (req, res) => {
       const file = files[fieldName]?.[0];
       if (!file) return null;
 
-      const result = await uploadToCloudinary(file.buffer, folder, "image", false);
+      const result = await uploadToCloudinary(
+        file.buffer,
+        folder,
+        "image",
+        false
+      );
       uploadedPublicIds.push(result.public_id);
       return result;
     };
@@ -690,12 +725,19 @@ export const createDriver = wrap(async (req, res) => {
       createdBy: req.tenant.userId,
     });
 
-    send(res, formatDriver(driver, null, req), "Driver created successfully.", 201);
+    send(
+      res,
+      formatDriver(driver, null, req),
+      "Driver created successfully.",
+      201
+    );
   } catch (err) {
     // Clean up only on failure
     if (uploadedPublicIds.length) {
       await Promise.allSettled(
-        uploadedPublicIds.map((id) => deleteFromCloudinary(id, "image", "upload"))
+        uploadedPublicIds.map((pid) =>
+          deleteFromCloudinary(pid, "image", "upload")
+        )
       );
     }
 
@@ -707,7 +749,7 @@ export const createDriver = wrap(async (req, res) => {
 });
 
 // ======================================================
-// 6. UPDATE DRIVER
+// 6. UPDATE DRIVER (images included)
 // ======================================================
 
 export const updateDriver = wrap(async (req, res) => {
@@ -723,7 +765,10 @@ export const updateDriver = wrap(async (req, res) => {
   }
 
   if (data.status === "assigned") {
-    throw fail("Assigned status is managed automatically by the booking workflow.", 400);
+    throw fail(
+      "Assigned status is managed automatically by the booking workflow.",
+      400
+    );
   }
 
   validatePaymentSettings(data, driver);
@@ -731,7 +776,8 @@ export const updateDriver = wrap(async (req, res) => {
   // Check both body fields and uploaded files
   if (
     !canEditSensitive(req) &&
-    (SENSITIVE_FIELDS.some((f) => data[f] !== undefined) || hasSensitiveFiles(req))
+    (SENSITIVE_FIELDS.some((f) => data[f] !== undefined) ||
+      hasSensitiveFiles(req))
   ) {
     throw fail(
       "You do not have permission to change sensitive driver information.",
@@ -778,7 +824,12 @@ export const updateDriver = wrap(async (req, res) => {
       const file = files[fieldName]?.[0];
       if (!file) return null;
 
-      const result = await uploadToCloudinary(file.buffer, folder, "image", false);
+      const result = await uploadToCloudinary(
+        file.buffer,
+        folder,
+        "image",
+        false
+      );
       uploadedPublicIds.push(result.public_id);
 
       if (existing[oldPublicIdField]) {
@@ -791,7 +842,10 @@ export const updateDriver = wrap(async (req, res) => {
     const photoResult = await uploadOne("photo", "photoPublicId");
     const cnicFrontResult = await uploadOne("cnicFront", "cnicFrontPublicId");
     const cnicBackResult = await uploadOne("cnicBack", "cnicBackPublicId");
-    const licenseResult = await uploadOne("licenseImage", "licenseImagePublicId");
+    const licenseResult = await uploadOne(
+      "licenseImage",
+      "licenseImagePublicId"
+    );
 
     if (photoResult) {
       data.photo = photoResult.secure_url;
@@ -816,20 +870,24 @@ export const updateDriver = wrap(async (req, res) => {
     // DB succeeded → delete OLD images only
     if (oldPublicIdsToDelete.length) {
       await Promise.allSettled(
-        oldPublicIdsToDelete.map((id) =>
-          deleteFromCloudinary(id, "image", "upload")
+        oldPublicIdsToDelete.map((pid) =>
+          deleteFromCloudinary(pid, "image", "upload")
         )
       );
     }
 
     const financials = await getDriverFinancials(req, driver._id);
-    send(res, formatDriver(driver, financials, req), "Driver updated successfully.");
+    send(
+      res,
+      formatDriver(driver, financials, req),
+      "Driver updated successfully."
+    );
   } catch (err) {
     // Clean up NEW uploads only on failure
     if (uploadedPublicIds.length) {
       await Promise.allSettled(
-        uploadedPublicIds.map((id) =>
-          deleteFromCloudinary(id, "image", "upload")
+        uploadedPublicIds.map((pid) =>
+          deleteFromCloudinary(pid, "image", "upload")
         )
       );
     }
@@ -884,7 +942,7 @@ export const deleteDriver = wrap(async (req, res) => {
 
   if (publicIds.length) {
     await Promise.allSettled(
-      publicIds.map((id) => deleteFromCloudinary(id, "image", "upload"))
+      publicIds.map((pid) => deleteFromCloudinary(pid, "image", "upload"))
     );
   }
 
@@ -912,7 +970,7 @@ export const getDriverBookings = wrap(async (req, res) => {
   const [bookings, total, financials] = await Promise.all([
     Booking.find(filter)
       .select(
-        "bookingNumber invoiceNumber carId customerId pickupDate returnDate status totalAmount driverPaymentAmount"
+        "bookingNumber invoiceNumber carId customerId pickupDate returnDate status totalAmount driverPaymentAmount driverPaymentType driverPaymentRate"
       )
       .populate("carId", "name numberPlate")
       .populate("customerId", "name phone")
@@ -924,20 +982,48 @@ export const getDriverBookings = wrap(async (req, res) => {
     getDriverFinancials(req, driver._id),
   ]);
 
-  const items = bookings.map((b) => ({
-    id: id(b._id),
-    bookingNumber: b.bookingNumber || "",
-    invoiceNumber: b.invoiceNumber || "",
-    customerName: b.customerId?.name || "",
-    customerPhone: b.customerId?.phone || "",
-    carName: b.carId?.name || "",
-    carPlate: b.carId?.numberPlate || "",
-    pickupDate: b.pickupDate,
-    returnDate: b.returnDate,
-    status: b.status,
-    bookingTotal: money(b.totalAmount),
-    payable: b.status === "cancelled" ? 0 : money(b.driverPaymentAmount),
-  }));
+  // Attach already-paid amounts
+  const bookingIds = bookings.map((b) => b._id);
+  const paidMap = new Map();
+
+  if (bookingIds.length) {
+    const expenses = await Expense.find({
+      ...tenantOnly(req),
+      bookingId: { $in: bookingIds },
+      driverId: driver._id,
+      category: "driver_payment",
+    })
+      .select("bookingId amount")
+      .lean();
+
+    for (const e of expenses) {
+      const key = id(e.bookingId);
+      paidMap.set(key, money((paidMap.get(key) || 0) + e.amount));
+    }
+  }
+
+  const items = bookings.map((b) => {
+    const payable = b.status === "cancelled" ? 0 : money(b.driverPaymentAmount);
+    const paid = paidMap.get(id(b._id)) || 0;
+    return {
+      id: id(b._id),
+      bookingNumber: b.bookingNumber || "",
+      invoiceNumber: b.invoiceNumber || "",
+      customerName: b.customerId?.name || "",
+      customerPhone: b.customerId?.phone || "",
+      carName: b.carId?.name || "",
+      carPlate: b.carId?.numberPlate || "",
+      pickupDate: b.pickupDate,
+      returnDate: b.returnDate,
+      status: b.status,
+      bookingTotal: money(b.totalAmount),
+      driverPaymentType: b.driverPaymentType,
+      driverPaymentRate: b.driverPaymentRate,
+      payable,
+      paid,
+      pending: money(Math.max(0, payable - paid)),
+    };
+  });
 
   send(res, {
     driver: formatDriver(driver, null, req),
@@ -953,7 +1039,7 @@ export const getDriverBookings = wrap(async (req, res) => {
 });
 
 // ======================================================
-// 9. DRIVER PAYMENT HISTORY
+// 9. DRIVER PAYMENT HISTORY (per-booking only for now)
 // ======================================================
 
 export const getDriverPayments = wrap(async (req, res) => {
@@ -966,7 +1052,7 @@ export const getDriverPayments = wrap(async (req, res) => {
     category: "driver_payment",
   };
 
-  // Simple date filter (no timezone helper assumed here)
+  // Simple date filter
   if (req.query.from) {
     const start = new Date(req.query.from);
     if (Number.isNaN(start.getTime())) throw fail("Invalid start date.", 400);
@@ -985,6 +1071,7 @@ export const getDriverPayments = wrap(async (req, res) => {
 
   const [expenses, total, financials] = await Promise.all([
     Expense.find(filter)
+      .populate("bookingId", "bookingNumber")
       .sort({ expenseDate: -1, _id: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
@@ -996,6 +1083,7 @@ export const getDriverPayments = wrap(async (req, res) => {
   const items = expenses.map((e) => ({
     id: id(e._id),
     bookingId: e.bookingId ? id(e.bookingId) : null,
+    bookingNumber: e.bookingId?.bookingNumber || "",
     amount: money(e.amount),
     title: e.title || "Driver Payment",
     paymentMethod: e.paymentMethod || "cash",
@@ -1033,7 +1121,7 @@ export const getDriverOverview = wrap(async (req, res) => {
   const [recentBookings, recentPayments] = await Promise.all([
     Booking.find(bookingFilter)
       .select(
-        "bookingNumber invoiceNumber carId customerId pickupDate returnDate status totalAmount driverPaymentAmount"
+        "bookingNumber invoiceNumber carId customerId pickupDate returnDate status totalAmount driverPaymentAmount driverPaymentType"
       )
       .populate("carId", "name numberPlate")
       .populate("customerId", "name phone")
@@ -1051,20 +1139,47 @@ export const getDriverOverview = wrap(async (req, res) => {
       .lean(),
   ]);
 
+  // Attach paid amounts to recent bookings
+  const bookingIds = recentBookings.map((b) => b._id);
+  const paidMap = new Map();
+
+  if (bookingIds.length) {
+    const expenses = await Expense.find({
+      ...tenantOnly(req),
+      bookingId: { $in: bookingIds },
+      driverId: driver._id,
+      category: "driver_payment",
+    })
+      .select("bookingId amount")
+      .lean();
+
+    for (const e of expenses) {
+      const key = id(e.bookingId);
+      paidMap.set(key, money((paidMap.get(key) || 0) + e.amount));
+    }
+  }
+
   send(res, {
     driver: formatDriver(driver, financials, req),
     summary: financials,
-    bookings: recentBookings.map((b) => ({
-      id: id(b._id),
-      bookingNumber: b.bookingNumber || "",
-      customerName: b.customerId?.name || "",
-      carName: b.carId?.name || "",
-      carPlate: b.carId?.numberPlate || "",
-      pickupDate: b.pickupDate,
-      returnDate: b.returnDate,
-      status: b.status,
-      payable: b.status === "cancelled" ? 0 : money(b.driverPaymentAmount),
-    })),
+    bookings: recentBookings.map((b) => {
+      const payable =
+        b.status === "cancelled" ? 0 : money(b.driverPaymentAmount);
+      const paid = paidMap.get(id(b._id)) || 0;
+      return {
+        id: id(b._id),
+        bookingNumber: b.bookingNumber || "",
+        customerName: b.customerId?.name || "",
+        carName: b.carId?.name || "",
+        carPlate: b.carId?.numberPlate || "",
+        pickupDate: b.pickupDate,
+        returnDate: b.returnDate,
+        status: b.status,
+        payable,
+        paid,
+        pending: money(Math.max(0, payable - paid)),
+      };
+    }),
     payments: recentPayments.map((e) => ({
       id: id(e._id),
       amount: money(e.amount),

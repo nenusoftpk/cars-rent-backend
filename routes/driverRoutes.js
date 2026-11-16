@@ -1,3 +1,4 @@
+// PATH: src/routes/driverRoutes.js
 import { Router } from "express";
 import { idParamSchema } from "../validations/listValidation.js";
 
@@ -34,10 +35,6 @@ const router = Router();
 
 router.use(authenticate, tenantMiddleware, checkSubscription);
 
-// ======================================================
-// IMAGE UPLOAD (same pattern as Customer)
-// ======================================================
-
 const driverImageUpload = handleUpload(
   uploadImages.fields([
     { name: "photo", maxCount: 1 },
@@ -46,10 +43,6 @@ const driverImageUpload = handleUpload(
     { name: "licenseImage", maxCount: 1 },
   ])
 );
-
-// ======================================================
-// ROUTES
-// ======================================================
 
 router.get("/", checkPermission("drivers.view"), listDrivers);
 router.get("/stats", checkPermission("drivers.view"), getDriverStats);
