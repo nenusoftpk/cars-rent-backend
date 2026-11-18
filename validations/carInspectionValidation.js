@@ -150,5 +150,5 @@ export const listInspectionQuerySchema = Joi.object({
   from: Joi.date().iso().optional(),
   to: Joi.date().iso().min(Joi.ref("from")).optional(),
   page: Joi.number().integer().min(1).default(1),
-  limit: Joi.number().integer().min(1).max(100).default(20),
+  limit: Joi.number().integer().min(1).max(3000).default(20),
 }).unknown(false);

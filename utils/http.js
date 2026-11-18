@@ -9,4 +9,4 @@ export const dateWindow = (query, field) => {
   if (range.$gte && range.$lt && range.$gte >= range.$lt) throw fail("To date must be after From date.");
   return Object.keys(range).length ? { [field]: range } : {};
 };
-export const paging = (query) => ({ page: Math.max(1, Math.min(100000, Number.parseInt(query.page, 10) || 1)), limit: Math.max(1, Math.min(100, Number.parseInt(query.limit, 10) || 10)) });
+export const paging = (query) => ({ page: Math.max(1, Math.min(100000, Number.parseInt(query.page, 10) || 1)), limit: Math.max(1, Math.min(3000, Number.parseInt(query.limit, 10) || 10)) });

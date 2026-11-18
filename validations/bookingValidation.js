@@ -205,7 +205,7 @@ export const bookingFilterSchema = Joi.object({
   limit: Joi.number()
     .integer()
     .min(1)
-    .max(100)
+    .max(3000)
     .default(10)
     .messages({
       "number.min": "Limit must be greater than zero.",

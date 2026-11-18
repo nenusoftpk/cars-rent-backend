@@ -81,7 +81,7 @@ export const listDocumentsQuerySchema = Joi.object({
     "number.min": "Page must be at least 1.",
   }),
 
-  limit: Joi.number().integer().min(1).max(100).default(50).messages({
+  limit: Joi.number().integer().min(1).max(3000).default(50).messages({
     "number.base": "Limit must be a number.",
     "number.min": "Limit must be at least 1.",
     "number.max": "Limit cannot exceed 100.",

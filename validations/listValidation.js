@@ -3,7 +3,7 @@ import { objectId } from "./common.js";
 export const idParamSchema = Joi.object({ id: objectId.required().messages({ "any.required": "Please select a record." }) });
 export const listQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1),
-  limit: Joi.number().integer().min(1).max(100).default(10),
+  limit: Joi.number().integer().min(1).max(3000).default(10),
   search: Joi.string().trim().max(150).allow(""),
   fromDate: Joi.date().iso(), toDate: Joi.date().iso(),
   sortBy: Joi.string().valid("createdAt", "updatedAt", "name", "date").default("createdAt"),
