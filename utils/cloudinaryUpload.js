@@ -22,13 +22,29 @@ const createError = (message, status = 400) => {
   return error;
 };
 
+
 const validateFolder = (folder) => {
-  if (
-    typeof folder !== "string" ||
-    !/^rent-a-car\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+$/.test(
-      folder
-    )
-  ) {
+  if (typeof folder !== "string") {
+    throw createError("Invalid Cloudinary folder.", 400);
+  }
+
+  // Supports:
+  // rent-a-car/{businessId}/customers
+  // rent-a-car/{businessId}/customers/guarantors
+  // rent-a-car/{businessId}/cars
+  // rent-a-car/{businessId}/drivers
+
+  const FOLDER_REGEX =
+    /^rent-a-car\/[a-fA-F0-9]{24}\/[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)*$/;
+
+  const isValid = FOLDER_REGEX.test(folder);
+
+  console.log("[CLOUDINARY FOLDER CHECK]", {
+    folder,
+    isValid,
+  });
+
+  if (!isValid) {
     throw createError("Invalid Cloudinary folder.", 400);
   }
 };

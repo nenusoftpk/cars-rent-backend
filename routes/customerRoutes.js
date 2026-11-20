@@ -35,7 +35,9 @@ router.use(authenticate, tenantMiddleware, checkSubscription);
 
 // ======================================================
 // IMAGE UPLOAD (same pattern as auth + inspection)
-// Fields: photo, cnicFront, cnicBack, licenseImage
+// Customer fields: photo, cnicFront, cnicBack, licenseImage
+// Guarantor fields: guarantor{1|2}Photo, guarantor{1|2}CnicFront,
+//                   guarantor{1|2}CnicBack
 // ======================================================
 
 const customerImageUpload = handleUpload(
@@ -44,6 +46,16 @@ const customerImageUpload = handleUpload(
     { name: "cnicFront", maxCount: 1 },
     { name: "cnicBack", maxCount: 1 },
     { name: "licenseImage", maxCount: 1 },
+
+    // Guarantor 1 documents
+    { name: "guarantor1Photo", maxCount: 1 },
+    { name: "guarantor1CnicFront", maxCount: 1 },
+    { name: "guarantor1CnicBack", maxCount: 1 },
+
+    // Guarantor 2 documents
+    { name: "guarantor2Photo", maxCount: 1 },
+    { name: "guarantor2CnicFront", maxCount: 1 },
+    { name: "guarantor2CnicBack", maxCount: 1 },
   ])
 );
 

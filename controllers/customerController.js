@@ -76,6 +76,30 @@ const SENSITIVE_FIELDS = [
 ];
 
 // ======================================================
+// GUARANTOR CONSTANTS
+// Request field names (multipart or JSON):
+//   guarantor{1|2}Enabled, guarantor{1|2}Name, guarantor{1|2}Mobile
+//   files: guarantor{1|2}Photo, guarantor{1|2}CnicFront, guarantor{1|2}CnicBack
+// ======================================================
+
+const GUARANTOR_INDEXES = [1, 2];
+
+const GUARANTOR_IMAGE_FIELDS = [
+  { key: "photo", suffix: "Photo", label: "photo" },
+  { key: "cnicFront", suffix: "CnicFront", label: "CNIC front image" },
+  { key: "cnicBack", suffix: "CnicBack", label: "CNIC back image" },
+];
+
+const PK_MOBILE_REGEX = /^(?:\+92|0092|92|0)?3\d{9}$/;
+
+// Select string that loads the hidden Cloudinary ids of both guarantors
+const GUARANTOR_PUBLIC_ID_SELECT = GUARANTOR_INDEXES.flatMap((index) =>
+  GUARANTOR_IMAGE_FIELDS.map(
+    ({ key }) => `+guarantor${index}.${key}PublicId`
+  )
+).join(" ");
+
+// ======================================================
 // HELPERS
 // ======================================================
 
@@ -194,13 +218,211 @@ const canEditSensitive = (req) => {
   );
 };
 
-// Helper used in create & update
+// ---------- Guarantor helpers ----------
+
+const hasOwn = (obj, key) =>
+  Object.prototype.hasOwnProperty.call(obj || {}, key);
+
+const toPlain = (value) => {
+  if (!value) return {};
+  return typeof value.toObject === "function" ? value.toObject() : { ...value };
+};
+
+const emptyGuarantor = () => ({
+  enabled: false,
+  name: "",
+  mobile: "",
+  photo: "",
+  photoPublicId: "",
+  cnicFront: "",
+  cnicFrontPublicId: "",
+  cnicBack: "",
+  cnicBackPublicId: "",
+});
+
+const parseFlag = (value, label) => {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "boolean") return value;
+  const text = String(value).trim().toLowerCase();
+  if (["true", "1", "on", "yes"].includes(text)) return true;
+  if (["false", "0", "off", "no"].includes(text)) return false;
+  throw fail(`${label}: invalid enabled flag.`, 400);
+};
+
+const collectGuarantorPublicIds = (guarantor) => {
+  const g = toPlain(guarantor);
+  return GUARANTOR_IMAGE_FIELDS.map(({ key }) => g[`${key}PublicId`]).filter(
+    Boolean
+  );
+};
+
+// Reads everything the client sent for one guarantor.
+const readGuarantorInput = (req, index) => {
+  const prefix = `guarantor${index}`;
+  const body = req.body || {};
+  const files = req.files || {};
+
+  const enabled = parseFlag(body[`${prefix}Enabled`], `Guarantor ${index}`);
+
+  const name = hasOwn(body, `${prefix}Name`)
+    ? String(body[`${prefix}Name`] ?? "").trim()
+    : undefined;
+
+  const mobile = hasOwn(body, `${prefix}Mobile`)
+    ? String(body[`${prefix}Mobile`] ?? "").replace(/[\s-]/g, "")
+    : undefined;
+
+  const imageFiles = {};
+  for (const { key, suffix } of GUARANTOR_IMAGE_FIELDS) {
+    imageFiles[key] = files[`${prefix}${suffix}`]?.[0] || null;
+  }
+
+  const touched =
+    enabled !== undefined ||
+    name !== undefined ||
+    mobile !== undefined ||
+    Object.values(imageFiles).some(Boolean);
+
+  return { key: prefix, index, enabled, name, mobile, files: imageFiles, touched };
+};
+
+const hasGuarantorInput = (req) =>
+  GUARANTOR_INDEXES.some((index) => readGuarantorInput(req, index).touched);
+
+// Validates one guarantor against what is already stored.
+// Runs BEFORE any Cloudinary upload so bad requests cost nothing.
+const resolveGuarantor = (input, current) => {
+  const label = `Guarantor ${input.index}`;
+  const base = {
+    key: input.key,
+    index: input.index,
+    touched: input.touched,
+    files: input.files,
+    current,
+  };
+
+  if (!input.touched) return { ...base, enabled: Boolean(current.enabled) };
+
+  const enabled =
+    input.enabled !== undefined ? input.enabled : Boolean(current.enabled);
+
+  // Disabled → any submitted guarantor data is ignored; stored data is removed.
+  if (!enabled) return { ...base, enabled: false };
+
+  const name =
+    input.name !== undefined ? input.name : String(current.name || "").trim();
+  const mobile =
+    input.mobile !== undefined
+      ? input.mobile
+      : String(current.mobile || "").trim();
+
+  if (!name) throw fail(`${label}: full name is required.`, 400);
+  if (name.length < 2 || name.length > 120) {
+    throw fail(`${label}: name must be between 2 and 120 characters.`, 400);
+  }
+  if (!mobile) throw fail(`${label}: mobile number is required.`, 400);
+  if (!PK_MOBILE_REGEX.test(mobile)) {
+    throw fail(
+      `${label}: enter a valid Pakistani mobile number, for example 03001234567.`,
+      400
+    );
+  }
+
+  for (const { key, label: imageLabel } of GUARANTOR_IMAGE_FIELDS) {
+    if (!input.files[key] && !current[key]) {
+      throw fail(`${label}: ${imageLabel} is required.`, 400);
+    }
+  }
+
+  return { ...base, enabled: true, name, mobile };
+};
+
+const planGuarantors = (req, existing) =>
+  GUARANTOR_INDEXES.map((index) => {
+    const input = readGuarantorInput(req, index);
+    const current = toPlain(existing?.[input.key]);
+    return resolveGuarantor(input, current);
+  });
+
+// Uploads new guarantor images and returns the sub-document to store.
+// - uploadedPublicIds: new uploads (deleted if saving fails)
+// - oldPublicIdsToDelete: replaced/removed images (deleted only after DB success)
+const buildGuarantorDocument = async (
+  plan,
+  folder,
+  uploadedPublicIds,
+  oldPublicIdsToDelete
+) => {
+  const { current } = plan;
+
+  if (!plan.enabled) {
+    oldPublicIdsToDelete.push(...collectGuarantorPublicIds(current));
+    return emptyGuarantor();
+  }
+
+  const doc = {
+    enabled: true,
+    name: plan.name,
+    mobile: plan.mobile,
+  };
+
+  for (const { key } of GUARANTOR_IMAGE_FIELDS) {
+    const file = plan.files[key];
+
+    if (file) {
+      const result = await uploadToCloudinary(
+        file.buffer,
+        `${folder}/guarantors`,
+        "image",
+        false
+      );
+      uploadedPublicIds.push(result.public_id);
+
+      doc[key] = result.secure_url;
+      doc[`${key}PublicId`] = result.public_id;
+
+      if (current[`${key}PublicId`]) {
+        oldPublicIdsToDelete.push(current[`${key}PublicId`]);
+      }
+    } else {
+      doc[key] = current[key] || "";
+      doc[`${key}PublicId`] = current[`${key}PublicId`] || "";
+    }
+  }
+
+  return doc;
+};
+
+// Public shape of a guarantor. Name/mobile follow normal customer access;
+// images are only included on detail responses for authorised users.
+const formatGuarantor = (guarantor, { sensitive, documents }) => {
+  const g = toPlain(guarantor);
+  const enabled = Boolean(g.enabled);
+
+  const out = {
+    enabled,
+    name: enabled ? g.name || "" : "",
+    mobile: enabled ? g.mobile || "" : "",
+    locked: !sensitive,
+  };
+
+  if (enabled && sensitive && documents) {
+    out.photo = g.photo || "";
+    out.cnicFront = g.cnicFront || "";
+    out.cnicBack = g.cnicBack || "";
+  }
+
+  return out;
+};
+
+// Helper used in create & update (customer documents + guarantor input)
 const hasSensitiveFiles = (req) => {
   const files = req.files || {};
   return Boolean(
     files.cnicFront?.[0] ||
     files.cnicBack?.[0] ||
-    files.licenseImage?.[0]
+    files.licenseImage?.[0] ||
+    hasGuarantorInput(req)
   );
 };
 
@@ -230,7 +452,7 @@ const maskCNIC = (value) => {
 
 // ---------- Formatting ----------
 
-const formatCustomer = (customer, req) => {
+const formatCustomer = (customer, req, { documents = false } = {}) => {
   const c = customer?.toObject ? customer.toObject() : { ...customer };
 
   const sensitive = canViewSensitive(req);
@@ -269,6 +491,14 @@ const formatCustomer = (customer, req) => {
     for (const field of SENSITIVE_FIELDS) {
       if (field !== "cnic") delete formatted[field];
     }
+  }
+
+  // Guarantors: rebuilt explicitly so Cloudinary ids never leak
+  for (const index of GUARANTOR_INDEXES) {
+    formatted[`guarantor${index}`] = formatGuarantor(c[`guarantor${index}`], {
+      sensitive,
+      documents,
+    });
   }
 
   // Opening balance is admin-only
@@ -350,10 +580,10 @@ const getSort = (value) => {
 const getBookingAmount = (booking) =>
   number(
     booking.totalAmount ??
-      booking.total ??
-      booking.grandTotal ??
-      booking.finalAmount ??
-      0
+    booking.total ??
+    booking.grandTotal ??
+    booking.finalAmount ??
+    0
   );
 
 const isRentalPayment = (payment) => {
@@ -393,11 +623,11 @@ const getCustomerFinancials = async (customer, req) => {
 
   const bookings = bookingAccess
     ? await Booking.find({
-        ...scope(req, "Booking"),
-        customerId: customer._id,
-      })
-        .sort({ createdAt: -1 })
-        .lean()
+      ...scope(req, "Booking"),
+      customerId: customer._id,
+    })
+      .sort({ createdAt: -1 })
+      .lean()
     : [];
 
   const bookingIds = bookings.map((b) => b._id);
@@ -405,11 +635,11 @@ const getCustomerFinancials = async (customer, req) => {
   const payments =
     bookingAccess && paymentAccess && bookingIds.length
       ? await Payment.find({
-          ...tenantOnly(req),
-          bookingId: { $in: bookingIds },
-        })
-          .sort({ paymentDate: -1, _id: -1 })
-          .lean()
+        ...tenantOnly(req),
+        bookingId: { $in: bookingIds },
+      })
+        .sort({ paymentDate: -1, _id: -1 })
+        .lean()
       : [];
 
   const totalSpent = bookings
@@ -472,12 +702,12 @@ const enrichCustomers = async (req, customers) => {
   const payments =
     financialAccess && bookingIds.length
       ? await Payment.find({
-          ...tenantOnly(req),
-          bookingId: { $in: bookingIds },
-          status: "completed",
-        })
-          .select("bookingId amount type status")
-          .lean()
+        ...tenantOnly(req),
+        bookingId: { $in: bookingIds },
+        status: "completed",
+      })
+        .select("bookingId amount type status")
+        .lean()
       : [];
 
   const metrics = new Map(
@@ -834,7 +1064,8 @@ export const getCustomer = wrap(async (req, res) => {
         payments:
           canViewBookings(req) && canViewPayments(req) ? payments : undefined,
       },
-      req
+      req,
+      { documents: true }
     ),
     "Customer details loaded successfully."
   );
@@ -882,6 +1113,9 @@ export const createCustomer = wrap(async (req, res) => {
     if (exists) throw fail("Customer code already exists.", 409);
   }
 
+  // Validate guarantors BEFORE uploading anything
+  const guarantorPlans = planGuarantors(req, null);
+
   const uploadedPublicIds = [];
   const folder = `rent-a-car/${req.tenant.businessId}/customers`;
 
@@ -892,6 +1126,13 @@ export const createCustomer = wrap(async (req, res) => {
     const uploadOne = async (fieldName) => {
       const file = files[fieldName]?.[0];
       if (!file) return null;
+
+      console.log("CLOUDINARY DEBUG:", {
+        businessId: req.tenant?.businessId,
+        businessIdType: typeof req.tenant?.businessId,
+        folder,
+        uploadedFields: Object.keys(req.files || {}),
+      });
 
       const result = await uploadToCloudinary(
         file.buffer,
@@ -925,6 +1166,16 @@ export const createCustomer = wrap(async (req, res) => {
       data.licenseImagePublicId = licenseResult.public_id;
     }
 
+    for (const plan of guarantorPlans) {
+      if (!plan.touched) continue;
+      data[plan.key] = await buildGuarantorDocument(
+        plan,
+        folder,
+        uploadedPublicIds,
+        []
+      );
+    }
+
     const created = await Customer.create({
       ...data,
       ...tenant,
@@ -932,7 +1183,12 @@ export const createCustomer = wrap(async (req, res) => {
     });
 
     // DB succeeded → do NOT clean up the new images
-    send(res, formatCustomer(created, req), "Customer created successfully.", 201);
+    send(
+      res,
+      formatCustomer(created, req, { documents: true }),
+      "Customer created successfully.",
+      201
+    );
   } catch (err) {
     // Only clean up when the whole operation failed
     if (uploadedPublicIds.length) {
@@ -973,7 +1229,7 @@ export const updateCustomer = wrap(async (req, res) => {
     (files) => Array.isArray(files) && files.length > 0
   );
 
-  if (!Object.keys(data).length && !hasFiles) {
+  if (!Object.keys(data).length && !hasFiles && !hasGuarantorInput(req)) {
     throw fail("Please provide customer information to update.", 400);
   }
 
@@ -999,7 +1255,7 @@ export const updateCustomer = wrap(async (req, res) => {
   };
 
   const existing = await Customer.findOne(filter).select(
-    "+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId"
+    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId ${GUARANTOR_PUBLIC_ID_SELECT}`
   );
   if (!existing) {
     throw fail("Customer not found or access denied.", 404);
@@ -1023,6 +1279,9 @@ export const updateCustomer = wrap(async (req, res) => {
     if (duplicate) throw fail("Customer code already exists.", 409);
   }
 
+  // Validate guarantors BEFORE uploading anything
+  const guarantorPlans = planGuarantors(req, existing);
+
   const uploadedPublicIds = [];
   const oldPublicIdsToDelete = [];
   const folder = `rent-a-car/${req.tenant.businessId}/customers`;
@@ -1031,22 +1290,39 @@ export const updateCustomer = wrap(async (req, res) => {
     const files = req.files || {};
 
     // Sequential uploads
-    const uploadOne = async (fieldName, oldPublicIdField) => {
+    const uploadOne = async (fieldName) => {
       const file = files[fieldName]?.[0];
       if (!file) return null;
 
-      const result = await uploadToCloudinary(
-        file.buffer,
-        folder,
-        "image",
-        false
-      );
-      uploadedPublicIds.push(result.public_id);
+      const started = Date.now();
 
-      if (existing[oldPublicIdField]) {
-        oldPublicIdsToDelete.push(existing[oldPublicIdField]);
+      console.log(`[UPLOAD START] ${fieldName}`, {
+        sizeKB: Math.round(file.size / 1024),
+      });
+
+      try {
+        const result = await uploadToCloudinary(
+          file.buffer,
+          folder,
+          "image",
+          false
+        );
+
+        uploadedPublicIds.push(result.public_id);
+
+        console.log(`[UPLOAD SUCCESS] ${fieldName}`, {
+          durationMs: Date.now() - started,
+        });
+
+        return result;
+      } catch (error) {
+        console.error(`[UPLOAD FAILED] ${fieldName}`, {
+          durationMs: Date.now() - started,
+          message: error.message,
+        });
+
+        throw error;
       }
-      return result;
     };
 
     const photoResult = await uploadOne("photo", "photoPublicId");
@@ -1071,6 +1347,16 @@ export const updateCustomer = wrap(async (req, res) => {
       data.licenseImagePublicId = licenseResult.public_id;
     }
 
+    for (const plan of guarantorPlans) {
+      if (!plan.touched) continue;
+      data[plan.key] = await buildGuarantorDocument(
+        plan,
+        folder,
+        uploadedPublicIds,
+        oldPublicIdsToDelete
+      );
+    }
+
     const updated = await Customer.findOneAndUpdate(
       filter,
       { $set: data },
@@ -1090,7 +1376,11 @@ export const updateCustomer = wrap(async (req, res) => {
       );
     }
 
-    send(res, formatCustomer(updated, req), "Customer updated successfully.");
+    send(
+      res,
+      formatCustomer(updated, req, { documents: true }),
+      "Customer updated successfully."
+    );
   } catch (err) {
     // Only clean up NEW uploads if the whole operation failed
     if (uploadedPublicIds.length) {
@@ -1128,7 +1418,7 @@ export const deleteCustomer = wrap(async (req, res) => {
     _id: req.params.id,
     ...scope(req, "Customer"),
   }).select(
-    "+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId"
+    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId ${GUARANTOR_PUBLIC_ID_SELECT}`
   );
 
   if (!customer) {
@@ -1163,6 +1453,8 @@ export const deleteCustomer = wrap(async (req, res) => {
     customer.cnicFrontPublicId,
     customer.cnicBackPublicId,
     customer.licenseImagePublicId,
+    ...collectGuarantorPublicIds(customer.guarantor1),
+    ...collectGuarantorPublicIds(customer.guarantor2),
   ].filter(Boolean);
 
   if (publicIds.length) {

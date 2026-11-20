@@ -2,6 +2,76 @@ import mongoose from "mongoose";
 
 const { Schema } = mongoose;
 
+// Pakistani mobile: 03001234567, +923001234567, 923001234567, 00923001234567
+const PK_MOBILE_REGEX = /^(?:\+92|0092|92|0)3\d{9}$/;
+
+// ======================================================
+// GUARANTOR (embedded sub-document)
+// Used twice: guarantor1 and guarantor2.
+// *PublicId fields are select:false so they never leave the
+// server unless a controller explicitly asks for them.
+// ======================================================
+
+const guarantorSchema = new Schema(
+  {
+    enabled: { type: Boolean, default: false },
+
+    name: {
+      type: String,
+      trim: true,
+      default: "",
+      maxlength: [120, "Guarantor name cannot exceed 120 characters."],
+    },
+
+    mobile: {
+      type: String,
+      trim: true,
+      default: "",
+      maxlength: [20, "Guarantor mobile cannot exceed 20 characters."],
+      validate: {
+        validator: (value) => !value || PK_MOBILE_REGEX.test(value),
+        message: "Enter a valid Pakistani mobile number for the guarantor.",
+      },
+    },
+
+    photo: { type: String, trim: true, default: "" },
+    photoPublicId: { type: String, default: "", select: false },
+
+    cnicFront: { type: String, trim: true, default: "" },
+    cnicFrontPublicId: { type: String, default: "", select: false },
+
+    cnicBack: { type: String, trim: true, default: "" },
+    cnicBackPublicId: { type: String, default: "", select: false },
+  },
+  { _id: false }
+);
+
+// When a guarantor is enabled, all five fields are mandatory.
+// (Runs on create()/save(). The controller performs the same check
+// for findOneAndUpdate(), where sub-document hooks do not run.)
+guarantorSchema.pre("validate", function () {
+  if (!this.enabled) return;
+
+  const missing = [];
+
+  if (!this.name?.trim()) missing.push("name");
+  if (!this.mobile?.trim()) missing.push("mobile");
+  if (!this.photo?.trim()) missing.push("photo");
+  if (!this.cnicFront?.trim()) missing.push("CNIC front image");
+  if (!this.cnicBack?.trim()) missing.push("CNIC back image");
+
+  if (missing.length) {
+    this.invalidate(
+      "enabled",
+      `Guarantor is enabled but missing: ${missing.join(", ")}.`
+    );
+  }
+});
+
+// ======================================================
+// CUSTOMER
+// ======================================================
+
 const customerSchema = new Schema(
   {
     businessId: {
@@ -99,6 +169,17 @@ const customerSchema = new Schema(
       default: null,
     },
 
+    // Optional guarantors (independent of each other)
+    guarantor1: {
+      type: guarantorSchema,
+      default: () => ({}),
+    },
+
+    guarantor2: {
+      type: guarantorSchema,
+      default: () => ({}),
+    },
+
     openingBalance: {
       type: Number,
       default: 0,
@@ -125,7 +206,7 @@ const customerSchema = new Schema(
   },
   {
     timestamps: true,
-    optimisticConcurrency: true
+    optimisticConcurrency: true,
   }
 );
 
