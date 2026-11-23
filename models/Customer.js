@@ -169,6 +169,26 @@ const customerSchema = new Schema(
       default: null,
     },
 
+    // ======================================================
+    // CUSTOMER THUMB FINGERPRINT
+    // ======================================================
+
+    biometric: {
+      // Saved fingerprint image reference
+      thumbImage: {
+        type: String,
+        default: "",
+        select: false,
+      },
+
+      // Date when thumb was scanned
+      scannedAt: {
+        type: Date,
+        default: null,
+      },
+    },
+
+
     // Optional guarantors (independent of each other)
     guarantor1: {
       type: guarantorSchema,

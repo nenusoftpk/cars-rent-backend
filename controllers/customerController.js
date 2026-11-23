@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import crypto from "crypto";
 
 import Customer from "../models/Customer.js";
 import Booking from "../models/Booking.js";
@@ -98,6 +99,15 @@ const GUARANTOR_PUBLIC_ID_SELECT = GUARANTOR_INDEXES.flatMap((index) =>
     ({ key }) => `+guarantor${index}.${key}PublicId`
   )
 ).join(" ");
+
+// Biometric / fingerprint (AES-256-GCM)
+const BIOMETRIC_KEY_ENV = "BIOMETRIC_ENCRYPTION_KEY";
+const FINGERPRINT_MAX_BYTES = 1024 * 1024; // 1 MB
+const FINGERPRINT_ALLOWED_MIME = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+]);
 
 // ======================================================
 // HELPERS
@@ -422,6 +432,7 @@ const hasSensitiveFiles = (req) => {
     files.cnicFront?.[0] ||
     files.cnicBack?.[0] ||
     files.licenseImage?.[0] ||
+    files.thumbImage?.[0] ||
     hasGuarantorInput(req)
   );
 };
@@ -448,6 +459,84 @@ const maskCNIC = (value) => {
   const digits = String(value).replace(/\D/g, "");
   if (digits.length !== 13) return "*****-*******-*";
   return `${digits.slice(0, 2)}***-*******-${digits.slice(-1)}`;
+};
+
+// ---------- Biometric / fingerprint helpers ----------
+
+const getBiometricKey = () => {
+  const secret = process.env[BIOMETRIC_KEY_ENV];
+  if (!secret || String(secret).trim().length < 8) {
+    throw fail("Biometric encryption is not configured on the server.", 500);
+  }
+
+  // Derive a full 32-byte AES-256 key from any passphrase (including a short 12-char one).
+  // scrypt is intentionally slow to resist brute-force on short secrets.
+  return crypto.scryptSync(String(secret).trim(), "rentacar-biometric-v1", 32);
+};
+
+const encryptFingerprint = (buffer) => {
+  const key = getBiometricKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+
+  // Layout: iv (12) + authTag (16) + ciphertext
+  return Buffer.concat([iv, authTag, encrypted]).toString("base64");
+};
+
+const decryptFingerprint = (encoded) => {
+  const key = getBiometricKey();
+  const data = Buffer.from(String(encoded), "base64");
+  if (data.length < 28) {
+    throw new Error("Invalid fingerprint payload.");
+  }
+
+  const iv = data.subarray(0, 12);
+  const authTag = data.subarray(12, 28);
+  const ciphertext = data.subarray(28);
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(authTag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+};
+
+const detectImageMime = (buffer) => {
+  if (!buffer || buffer.length < 4) return "image/png";
+  if (buffer[0] === 0x89 && buffer[1] === 0x50) return "image/png";
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) return "image/jpeg";
+  return "image/png";
+};
+
+/**
+ * Validate + encrypt an incoming thumbImage file.
+ * Requires explicit customer consent (biometricConsent=true).
+ * Returns the biometric sub-document ready to $set, or null if no file.
+ */
+const processFingerprintUpload = (req) => {
+  const file = (req.files || {}).thumbImage?.[0];
+  if (!file) return null;
+
+  const mime = String(file.mimetype || "").toLowerCase();
+  if (!FINGERPRINT_ALLOWED_MIME.has(mime)) {
+    throw fail("Fingerprint image must be PNG or JPEG.", 400);
+  }
+  if (file.size > FINGERPRINT_MAX_BYTES) {
+    throw fail("Fingerprint image must be smaller than 1 MB.", 400);
+  }
+
+  const consent = parseFlag(req.body?.biometricConsent, "Biometric consent");
+  if (consent !== true) {
+    throw fail(
+      "Customer consent is required before storing a fingerprint image.",
+      400
+    );
+  }
+
+  return {
+    thumbImage: encryptFingerprint(file.buffer),
+    scannedAt: new Date(),
+  };
 };
 
 // ---------- Formatting ----------
@@ -508,6 +597,32 @@ const formatCustomer = (customer, req, { documents = false } = {}) => {
 
   if (!bookingAccess) delete formatted.bookings;
   if (!canViewPayments(req) || !bookingAccess) delete formatted.payments;
+
+  // ---------- Biometric / fingerprint ----------
+  // Never leak the encrypted payload. List views only get availability.
+  // Detail views for authorised users also receive a printable data-URL.
+  delete formatted.biometric;
+
+  const bio = toPlain(c.biometric);
+  const hasFingerprint = Boolean(bio.thumbImage);
+  formatted.hasFingerprint = hasFingerprint;
+
+  if (hasFingerprint) {
+    formatted.biometric = {
+      available: true,
+      scannedAt: bio.scannedAt || null,
+    };
+
+    if (sensitive && documents) {
+      try {
+        const raw = decryptFingerprint(bio.thumbImage);
+        const mime = detectImageMime(raw);
+        formatted.biometric.thumbImage = `data:${mime};base64,${raw.toString("base64")}`;
+      } catch {
+        // Decrypt failure → leave the image out; availability flag remains.
+      }
+    }
+  }
 
   delete formatted.__v;
   delete formatted._id;
@@ -608,7 +723,7 @@ const requireCustomer = async (req) => {
   const customer = await Customer.findOne({
     _id: req.params.id,
     ...scope(req, "Customer"),
-  });
+  }).select("+biometric.thumbImage");
 
   if (!customer) {
     throw fail("Customer not found or access denied.", 404);
@@ -932,9 +1047,14 @@ export const listCustomers = wrap(async (req, res) => {
   let pendingCount = 0;
   let pendingAmount = 0;
 
+  // Always select the encrypted thumb so we can report hasFingerprint
+  // without ever exposing the ciphertext in the response.
+  const biometricSelect = "+biometric.thumbImage";
+
   if (!needsComputedSort && !hasDuesOnly) {
     const [dbItems, dbTotal] = await Promise.all([
       Customer.find(filter)
+        .select(biometricSelect)
         .sort(sort)
         .skip((page - 1) * limit)
         .limit(limit)
@@ -960,7 +1080,7 @@ export const listCustomers = wrap(async (req, res) => {
       }
     }
   } else {
-    const filtered = await Customer.find(filter).lean();
+    const filtered = await Customer.find(filter).select(biometricSelect).lean();
     let enriched = await enrichCustomers(req, filtered);
 
     if (hasDuesOnly) {
@@ -1116,6 +1236,12 @@ export const createCustomer = wrap(async (req, res) => {
   // Validate guarantors BEFORE uploading anything
   const guarantorPlans = planGuarantors(req, null);
 
+  // Validate + encrypt fingerprint BEFORE any Cloudinary work
+  const biometricDoc = processFingerprintUpload(req);
+  if (biometricDoc) {
+    data.biometric = biometricDoc;
+  }
+
   const uploadedPublicIds = [];
   const folder = `rent-a-car/${req.tenant.businessId}/customers`;
 
@@ -1255,7 +1381,7 @@ export const updateCustomer = wrap(async (req, res) => {
   };
 
   const existing = await Customer.findOne(filter).select(
-    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId ${GUARANTOR_PUBLIC_ID_SELECT}`
+    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId +biometric.thumbImage ${GUARANTOR_PUBLIC_ID_SELECT}`
   );
   if (!existing) {
     throw fail("Customer not found or access denied.", 404);
@@ -1281,6 +1407,13 @@ export const updateCustomer = wrap(async (req, res) => {
 
   // Validate guarantors BEFORE uploading anything
   const guarantorPlans = planGuarantors(req, existing);
+
+  // Validate + encrypt fingerprint BEFORE any Cloudinary work.
+  // If no new file is supplied the existing fingerprint is left untouched.
+  const biometricDoc = processFingerprintUpload(req);
+  if (biometricDoc) {
+    data.biometric = biometricDoc;
+  }
 
   const uploadedPublicIds = [];
   const oldPublicIdsToDelete = [];
@@ -1418,7 +1551,7 @@ export const deleteCustomer = wrap(async (req, res) => {
     _id: req.params.id,
     ...scope(req, "Customer"),
   }).select(
-    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId ${GUARANTOR_PUBLIC_ID_SELECT}`
+    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId +biometric.thumbImage ${GUARANTOR_PUBLIC_ID_SELECT}`
   );
 
   if (!customer) {
@@ -1447,7 +1580,8 @@ export const deleteCustomer = wrap(async (req, res) => {
     throw fail("Customer not found or access denied.", 404);
   }
 
-  // Clean up Cloudinary images after successful deletion
+  // Clean up Cloudinary images after successful deletion.
+  // Fingerprint data lives only in the document and is removed with it.
   const publicIds = [
     customer.photoPublicId,
     customer.cnicFrontPublicId,
