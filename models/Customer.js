@@ -42,6 +42,21 @@ const guarantorSchema = new Schema(
 
     cnicBack: { type: String, trim: true, default: "" },
     cnicBackPublicId: { type: String, default: "", select: false },
+
+    // ======================================================
+    // GUARANTOR THUMB FINGERPRINT (same pattern as customer)
+    // ======================================================
+    biometric: {
+      thumbImage: {
+        type: String,
+        default: "",
+        select: false, // never returned unless explicitly selected
+      },
+      scannedAt: {
+        type: Date,
+        default: null,
+      },
+    },
   },
   { _id: false }
 );

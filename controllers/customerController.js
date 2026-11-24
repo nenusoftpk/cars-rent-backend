@@ -99,6 +99,10 @@ const GUARANTOR_PUBLIC_ID_SELECT = GUARANTOR_INDEXES.flatMap((index) =>
     ({ key }) => `+guarantor${index}.${key}PublicId`
   )
 ).join(" ");
+// Select string that loads the hidden encrypted thumb for both guarantors
+const GUARANTOR_BIOMETRIC_SELECT = GUARANTOR_INDEXES.map(
+  (index) => `+guarantor${index}.biometric.thumbImage`
+).join(" ");
 
 // Biometric / fingerprint (AES-256-GCM)
 const BIOMETRIC_KEY_ENV = "BIOMETRIC_ENCRYPTION_KEY";
@@ -248,6 +252,10 @@ const emptyGuarantor = () => ({
   cnicFrontPublicId: "",
   cnicBack: "",
   cnicBackPublicId: "",
+  biometric: {
+    thumbImage: "",
+    scannedAt: null,
+  },
 });
 
 const parseFlag = (value, label) => {
@@ -266,7 +274,6 @@ const collectGuarantorPublicIds = (guarantor) => {
   );
 };
 
-// Reads everything the client sent for one guarantor.
 const readGuarantorInput = (req, index) => {
   const prefix = `guarantor${index}`;
   const body = req.body || {};
@@ -287,13 +294,25 @@ const readGuarantorInput = (req, index) => {
     imageFiles[key] = files[`${prefix}${suffix}`]?.[0] || null;
   }
 
+  const thumbFile = files[`${prefix}ThumbImage`]?.[0] || null;
+
   const touched =
     enabled !== undefined ||
     name !== undefined ||
     mobile !== undefined ||
-    Object.values(imageFiles).some(Boolean);
+    Object.values(imageFiles).some(Boolean) ||
+    Boolean(thumbFile);
 
-  return { key: prefix, index, enabled, name, mobile, files: imageFiles, touched };
+  return {
+    key: prefix,
+    index,
+    enabled,
+    name,
+    mobile,
+    files: imageFiles,
+    thumbFile,
+    touched,
+  };
 };
 
 const hasGuarantorInput = (req) =>
@@ -361,7 +380,8 @@ const buildGuarantorDocument = async (
   plan,
   folder,
   uploadedPublicIds,
-  oldPublicIdsToDelete
+  oldPublicIdsToDelete,
+  req // ← pass req so we can process the thumb
 ) => {
   const { current } = plan;
 
@@ -376,6 +396,7 @@ const buildGuarantorDocument = async (
     mobile: plan.mobile,
   };
 
+  // ---- Cloudinary images (photo / CNIC) ----
   for (const { key } of GUARANTOR_IMAGE_FIELDS) {
     const file = plan.files[key];
 
@@ -400,6 +421,19 @@ const buildGuarantorDocument = async (
     }
   }
 
+  // ---- Biometric (optional) ----
+  const newBio = processGuarantorFingerprint(req, plan.index);
+  if (newBio) {
+    doc.biometric = newBio;
+  } else {
+    // keep whatever was already stored
+    const existingBio = toPlain(current.biometric);
+    doc.biometric = {
+      thumbImage: existingBio.thumbImage || "",
+      scannedAt: existingBio.scannedAt || null,
+    };
+  }
+
   return doc;
 };
 
@@ -422,10 +456,31 @@ const formatGuarantor = (guarantor, { sensitive, documents }) => {
     out.cnicBack = g.cnicBack || "";
   }
 
+  // ---------- Guarantor biometric ----------
+  const bio = toPlain(g.biometric);
+  const hasFingerprint = Boolean(bio.thumbImage);
+  out.hasFingerprint = hasFingerprint;
+
+  if (hasFingerprint) {
+    out.biometric = {
+      available: true,
+      scannedAt: bio.scannedAt || null,
+    };
+
+    if (sensitive && documents) {
+      try {
+        const raw = decryptFingerprint(bio.thumbImage);
+        const mime = detectImageMime(raw);
+        out.biometric.thumbImage = `data:${mime};base64,${raw.toString("base64")}`;
+      } catch {
+        // leave image out; availability flag stays
+      }
+    }
+  }
+
   return out;
 };
 
-// Helper used in create & update (customer documents + guarantor input)
 const hasSensitiveFiles = (req) => {
   const files = req.files || {};
   return Boolean(
@@ -433,6 +488,8 @@ const hasSensitiveFiles = (req) => {
     files.cnicBack?.[0] ||
     files.licenseImage?.[0] ||
     files.thumbImage?.[0] ||
+    files.guarantor1ThumbImage?.[0] ||
+    files.guarantor2ThumbImage?.[0] ||
     hasGuarantorInput(req)
   );
 };
@@ -509,26 +566,27 @@ const detectImageMime = (buffer) => {
 };
 
 /**
- * Validate + encrypt an incoming thumbImage file.
- * Requires explicit customer consent (biometricConsent=true).
- * Returns the biometric sub-document ready to $set, or null if no file.
+ * Validate + encrypt an incoming fingerprint file.
+ * @param {object} file  – multer file object (or null)
+ * @param {string|boolean|undefined} consentRaw – body flag (biometricConsent / guarantorNBiometricConsent)
+ * @param {string} label – used in error messages ("Customer" / "Guarantor 1" …)
+ * @returns {{ thumbImage: string, scannedAt: Date } | null}
  */
-const processFingerprintUpload = (req) => {
-  const file = (req.files || {}).thumbImage?.[0];
+const processFingerprintFile = (file, consentRaw, label = "Customer") => {
   if (!file) return null;
 
   const mime = String(file.mimetype || "").toLowerCase();
   if (!FINGERPRINT_ALLOWED_MIME.has(mime)) {
-    throw fail("Fingerprint image must be PNG or JPEG.", 400);
+    throw fail(`${label} fingerprint image must be PNG or JPEG.`, 400);
   }
   if (file.size > FINGERPRINT_MAX_BYTES) {
-    throw fail("Fingerprint image must be smaller than 1 MB.", 400);
+    throw fail(`${label} fingerprint image must be smaller than 1 MB.`, 400);
   }
 
-  const consent = parseFlag(req.body?.biometricConsent, "Biometric consent");
+  const consent = parseFlag(consentRaw, `${label} biometric consent`);
   if (consent !== true) {
     throw fail(
-      "Customer consent is required before storing a fingerprint image.",
+      `${label} consent is required before storing a fingerprint image.`,
       400
     );
   }
@@ -538,6 +596,21 @@ const processFingerprintUpload = (req) => {
     scannedAt: new Date(),
   };
 };
+
+// Convenience wrappers
+const processCustomerFingerprint = (req) =>
+  processFingerprintFile(
+    (req.files || {}).thumbImage?.[0],
+    req.body?.biometricConsent,
+    "Customer"
+  );
+
+const processGuarantorFingerprint = (req, index) =>
+  processFingerprintFile(
+    (req.files || {})[`guarantor${index}ThumbImage`]?.[0],
+    req.body?.[`guarantor${index}BiometricConsent`],
+    `Guarantor ${index}`
+  );
 
 // ---------- Formatting ----------
 
@@ -1049,7 +1122,7 @@ export const listCustomers = wrap(async (req, res) => {
 
   // Always select the encrypted thumb so we can report hasFingerprint
   // without ever exposing the ciphertext in the response.
-  const biometricSelect = "+biometric.thumbImage";
+  const biometricSelect = `+biometric.thumbImage ${GUARANTOR_BIOMETRIC_SELECT}`;
 
   if (!needsComputedSort && !hasDuesOnly) {
     const [dbItems, dbTotal] = await Promise.all([
@@ -1237,7 +1310,7 @@ export const createCustomer = wrap(async (req, res) => {
   const guarantorPlans = planGuarantors(req, null);
 
   // Validate + encrypt fingerprint BEFORE any Cloudinary work
-  const biometricDoc = processFingerprintUpload(req);
+  const biometricDoc = processCustomerFingerprint(req);
   if (biometricDoc) {
     data.biometric = biometricDoc;
   }
@@ -1298,7 +1371,8 @@ export const createCustomer = wrap(async (req, res) => {
         plan,
         folder,
         uploadedPublicIds,
-        []
+        [],          // create has no old images
+        req
       );
     }
 
@@ -1381,7 +1455,7 @@ export const updateCustomer = wrap(async (req, res) => {
   };
 
   const existing = await Customer.findOne(filter).select(
-    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId +biometric.thumbImage ${GUARANTOR_PUBLIC_ID_SELECT}`
+    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId +biometric.thumbImage ${GUARANTOR_PUBLIC_ID_SELECT} ${GUARANTOR_BIOMETRIC_SELECT}`
   );
   if (!existing) {
     throw fail("Customer not found or access denied.", 404);
@@ -1410,7 +1484,7 @@ export const updateCustomer = wrap(async (req, res) => {
 
   // Validate + encrypt fingerprint BEFORE any Cloudinary work.
   // If no new file is supplied the existing fingerprint is left untouched.
-  const biometricDoc = processFingerprintUpload(req);
+  const biometricDoc = processCustomerFingerprint(req);
   if (biometricDoc) {
     data.biometric = biometricDoc;
   }
@@ -1486,7 +1560,8 @@ export const updateCustomer = wrap(async (req, res) => {
         plan,
         folder,
         uploadedPublicIds,
-        oldPublicIdsToDelete
+        oldPublicIdsToDelete,   // or [] on create
+        req
       );
     }
 
@@ -1551,7 +1626,7 @@ export const deleteCustomer = wrap(async (req, res) => {
     _id: req.params.id,
     ...scope(req, "Customer"),
   }).select(
-    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId +biometric.thumbImage ${GUARANTOR_PUBLIC_ID_SELECT}`
+    `+photoPublicId +cnicFrontPublicId +cnicBackPublicId +licenseImagePublicId +biometric.thumbImage ${GUARANTOR_PUBLIC_ID_SELECT} ${GUARANTOR_BIOMETRIC_SELECT}`
   );
 
   if (!customer) {

@@ -46,17 +46,19 @@ const customerImageUpload = handleUpload(
     { name: "cnicFront", maxCount: 1 },
     { name: "cnicBack", maxCount: 1 },
     { name: "licenseImage", maxCount: 1 },
-    { name: "thumbImage", maxCount: 1 },          // Fingerprint (SecuGen)
+    { name: "thumbImage", maxCount: 1 },          // Customer fingerprint
 
-    // Guarantor 1 documents
+    // Guarantor 1
     { name: "guarantor1Photo", maxCount: 1 },
     { name: "guarantor1CnicFront", maxCount: 1 },
     { name: "guarantor1CnicBack", maxCount: 1 },
+    { name: "guarantor1ThumbImage", maxCount: 1 }, // NEW
 
-    // Guarantor 2 documents
+    // Guarantor 2
     { name: "guarantor2Photo", maxCount: 1 },
     { name: "guarantor2CnicFront", maxCount: 1 },
     { name: "guarantor2CnicBack", maxCount: 1 },
+    { name: "guarantor2ThumbImage", maxCount: 1 }, // NEW
   ])
 );
 
