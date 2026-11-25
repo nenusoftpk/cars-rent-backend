@@ -6,8 +6,11 @@
   "scripts": {
     "dev": "nodemon server.js",
     "start": "node server.js",
+    "seed:super-admin": "node seeders/createSuperAdmin.js",
     "seed:cars": "node seeders/carSeeder.js",
-    "seed:car-images": "node seeders/carImageSeeder.js"
+    "seed:car-images": "node seeders/carImageSeeder.js",
+    "seed:cars:all": "npm run seed:cars && npm run seed:car-images",
+    "seed:download-images": "node seeders/downloadCarImages.js"
   },
   "keywords": [],
   "author": "",
