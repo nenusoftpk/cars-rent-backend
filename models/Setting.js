@@ -14,6 +14,11 @@ const settingSchema = new Schema({
   timezone: { type: String, trim: true, default: "Asia/Karachi" },
   dateFormat: { type: String, enum: ["DD/MM/YYYY", "MM/DD/YYYY", "YYYY-MM-DD"], default: "DD/MM/YYYY" },
   reminderDaysBefore: { type: Number, min: 0, max: 365, default: 7 },
+  // Terms & Conditions
+  termsAndConditions: {
+    type: [String],
+    default: [],
+  },
   updatedBy: { type: Schema.Types.ObjectId, ref: "User", default: null },
 }, { timestamps: true });
 export default mongoose.models.Setting || mongoose.model("Setting", settingSchema);

@@ -382,6 +382,12 @@ const bookingSchema = new Schema(
       default: "",
     },
 
+    // Terms & Conditions
+    termsAndConditions: {
+      type: [String],
+      default: [],
+    },
+
     // Booking Activity History
     history: {
       type: [

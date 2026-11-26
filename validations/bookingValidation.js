@@ -131,6 +131,10 @@ export const updateBookingSchema = Joi.object({
   driverPaymentAmount: amount,
 
   specialInstructions: optionalText.max(2000),
+  // Booking-specific Terms & Conditions
+  termsAndConditions: Joi.array()
+    .items(Joi.string().trim().min(1))
+    .optional(),
 })
   .min(1)
   .custom((value, helpers) => {
@@ -138,7 +142,7 @@ export const updateBookingSchema = Joi.object({
       value.pickupDate &&
       value.returnDate &&
       new Date(value.returnDate) <=
-        new Date(value.pickupDate)
+      new Date(value.pickupDate)
     ) {
       return helpers.message(
         "Return date must be after pickup date."

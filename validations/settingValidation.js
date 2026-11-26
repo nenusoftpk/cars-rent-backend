@@ -12,4 +12,7 @@ export const updateSettingSchema = Joi.object({
   timezone: Joi.string().trim().max(100),
   dateFormat: Joi.string().valid("DD/MM/YYYY", "MM/DD/YYYY", "YYYY-MM-DD"),
   reminderDaysBefore: Joi.number().integer().min(0).max(365),
+  termsAndConditions: Joi.array()
+    .items(Joi.string().trim().min(1))
+    .optional(),
 }).min(1);

@@ -12,6 +12,7 @@ import Driver from "../models/Driver.js";
 import User from "../models/User.js";
 import Payment from "../models/Payment.js";
 import Expense from "../models/Expense.js";
+import Setting from "../models/Setting.js";
 
 import { wrap, send, fail, paging } from "../utils/http.js";
 import { scope, tenantOnly, checkRef } from "../services/scope.js";
@@ -49,6 +50,21 @@ const id = (value) =>
 
 const tenant = (req) => tenantOnly(req);
 const bookingScope = (req) => scope(req, "Booking");
+
+// Capture the current business Terms & Conditions
+const getBookingTerms = async (req, session) => {
+  const settings = await Setting.findOne(tenant(req))
+    .select("termsAndConditions")
+    .session(session)
+    .lean();
+
+  return Array.isArray(settings?.termsAndConditions)
+    ? settings.termsAndConditions
+      .filter((term) => typeof term === "string")
+      .map((term) => term.trim())
+      .filter(Boolean)
+    : [];
+};
 
 const isOwnEmployee = (req) =>
   req.tenant.role === "employee" &&
@@ -549,6 +565,10 @@ const formatBooking = (
     displayStatus: labels[b.status] || b.status,
 
     instructions: b.specialInstructions || "",
+
+    termsAndConditions: Array.isArray(b.termsAndConditions)
+      ? b.termsAndConditions
+      : [],
 
     issue: formatInspection(inspections?.issue || b.issueInspection),
     returnInfo: formatInspection(inspections?.return || b.returnInspection),
@@ -1184,6 +1204,10 @@ export const createBooking = wrap(async (req, res) => {
     if (carConflict) throw fail("This car is already booked for the selected dates.", 409);
     if (await hasDriverCollision(req, driverId, start, end, null, session))
       throw fail("This driver is already assigned during these dates.", 409);
+
+    // Get current business Terms & Conditions
+    const termsAndConditions = await getBookingTerms(req, session);
+
     const [created] = await Booking.create([{
       ...tenant(req),
 
@@ -1220,6 +1244,9 @@ export const createBooking = wrap(async (req, res) => {
 
       specialInstructions: d.specialInstructions || "",
 
+      // Save business Terms & Conditions permanently
+      termsAndConditions,
+
       status: "reserved",
 
       history: [
@@ -1245,6 +1272,99 @@ export const createBooking = wrap(async (req, res) => {
 
 export const updateBooking = wrap(async (req, res) => {
   const d = req.body;
+
+  const termsOnly =
+    Object.keys(d).length === 1 &&
+    d.termsAndConditions !== undefined;
+
+  // Validate Terms & Conditions
+  if (d.termsAndConditions !== undefined) {
+    if (
+      !Array.isArray(d.termsAndConditions) ||
+      d.termsAndConditions.some(
+        (term) => typeof term !== "string"
+      )
+    ) {
+      throw fail("Invalid Terms & Conditions.", 400);
+    }
+
+    d.termsAndConditions = d.termsAndConditions
+      .map((term) => term.trim())
+      .filter(Boolean);
+  }
+
+  // Update only booking-specific Terms & Conditions
+  if (termsOnly) {
+    const filter = {
+      ...bookingScope(req),
+      _id: req.params.id,
+      status: "reserved",
+    };
+
+    // Employees can edit terms only for bookings
+    // created by themselves.
+    if (req.tenant.role === "employee") {
+      filter.createdBy = req.tenant.userId;
+    } else if (!isAdmin(req)) {
+      throw fail("Permission denied.", 403);
+    }
+
+    const updated = await Booking.findOneAndUpdate(
+      filter,
+      {
+        $set: {
+          termsAndConditions: d.termsAndConditions,
+        },
+
+        $push: {
+          history: {
+            text: "Terms & Conditions updated",
+            at: new Date(),
+            by: req.tenant.userId,
+          },
+        },
+
+        $inc: {
+          __v: 1,
+        },
+      },
+      {
+        new: true,
+        runValidators: true,
+      }
+    );
+
+    if (!updated) {
+      throw fail(
+        "Booking not found, access denied, or booking is no longer reserved.",
+        404
+      );
+    }
+
+    const formatted = await loadAndFormatBooking(
+      req,
+      updated._id
+    );
+
+    return send(
+      res,
+      formatted,
+      "Terms & Conditions updated successfully."
+    );
+  }
+
+  // Only admins can update terms together with
+  // other booking details.
+  if (
+    d.termsAndConditions !== undefined &&
+    !isAdmin(req)
+  ) {
+    throw fail(
+      "Please update Terms & Conditions separately.",
+      403
+    );
+  }
+
   await checkRelated(req, d);
   const existing = await Booking.findOne({ _id: req.params.id, ...bookingScope(req) }).lean();
   if (!existing) throw fail("Booking not found or access denied.", 404);
@@ -1293,8 +1413,23 @@ export const updateBooking = wrap(async (req, res) => {
     booking.discount = discount;
     Object.assign(booking, driverPay);
     if (d.employeeId !== undefined && !isOwnEmployee(req)) booking.employeeId = d.employeeId || null;
-    for (const field of ["pickupLocation", "returnLocation", "specialInstructions"]) {
+    for (const field of [
+      "pickupLocation",
+      "returnLocation",
+      "specialInstructions"
+    ]) {
       if (d[field] !== undefined) booking[field] = d[field];
+    }
+
+    // Update booking-specific Terms & Conditions
+    if (d.termsAndConditions !== undefined) {
+      booking.termsAndConditions = d.termsAndConditions;
+
+      addHistory(
+        booking,
+        "Terms & Conditions updated",
+        req.tenant.userId
+      );
     }
     if (d.securityDeposit !== undefined) {
       booking.securityDeposit = checkAmount(d.securityDeposit, "security deposit");

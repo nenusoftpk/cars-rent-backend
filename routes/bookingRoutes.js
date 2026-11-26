@@ -35,6 +35,28 @@ import {
 
 const router = Router();
 
+const checkBookingUpdatePermission = (req, res, next) => {
+  const keys = Object.keys(req.body || {});
+
+  const termsOnly =
+    keys.length === 1 &&
+    keys[0] === "termsAndConditions";
+
+  if (termsOnly) {
+    return checkPermission("bookings.create")(
+      req,
+      res,
+      next
+    );
+  }
+
+  return checkPermission("bookings.update")(
+    req,
+    res,
+    next
+  );
+};
+
 // ======================================================
 // COMMON MIDDLEWARES
 // ======================================================
@@ -111,8 +133,8 @@ router.get(
 
 router.patch(
   "/:id",
-  checkPermission("bookings.update"),
   validate(bookingIdSchema, "params"),
+  checkBookingUpdatePermission,
   validate(updateBookingSchema),
   updateBooking
 );

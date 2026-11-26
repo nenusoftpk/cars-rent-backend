@@ -20,6 +20,7 @@ const EDITABLE_FIELDS = [
   "timezone",
   "dateFormat",
   "reminderDaysBefore",
+  "termsAndConditions",
 ];
 
 // ======================================================
@@ -41,6 +42,7 @@ const formatSettings = (settings) => {
       timezone: "Asia/Karachi",
       dateFormat: "DD/MM/YYYY",
       reminderDaysBefore: 7,
+      termsAndConditions: [],
     };
   }
 
@@ -83,6 +85,21 @@ export const updateSettings = wrap(async (req, res) => {
   }
 
   // Basic validation
+  // Terms & Conditions validation
+  if (data.termsAndConditions !== undefined) {
+    if (
+      !Array.isArray(data.termsAndConditions) ||
+      data.termsAndConditions.some(
+        (term) => typeof term !== "string"
+      )
+    ) {
+      throw fail("Invalid Terms & Conditions.", 400);
+    }
+
+    data.termsAndConditions = data.termsAndConditions
+      .map((term) => term.trim())
+      .filter(Boolean);
+  }
   if (data.receiptPaperSize && !["a4", "a5", "80mm", "58mm"].includes(data.receiptPaperSize)) {
     throw fail("Invalid receipt paper size.", 400);
   }
